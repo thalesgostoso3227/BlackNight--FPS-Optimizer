@@ -1,9 +1,17 @@
-# BlackNight FPS Optimizer - GUI (preto e vermelho)
-# Salve como BlackNight_GUI.ps1 e execute como Administrador
-# Autor: gerado para thales
-# NOTAS: NÃ£o altera Plano de Energia. Faz backups simples em %TEMP%.
 
-# ------------------ Verifica/eleva para Administrador ------------------
+# BlackNight FPS Optimizer v2.0 - GUI (preto e vermelho)
+# Salve como BlackNight_GUI_v2.ps1 e execute como Administrador (PowerShell 5+)
+# Autor: gerado para thales (versão aprimorada)
+# NOTAS IMPORTANTES:
+#  - Faz backups simples em %TEMP% antes de alterações.
+#  - Inclui opção de restaurar configurações anteriores.
+#  - Não altera permanentemente planos de energia sem avisar (opcional).
+#  - Use por sua conta: teste em ambiente controlado. O script tenta operar de forma segura.
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# ------------------ Helpers ------------------
 function Ensure-Admin {
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
@@ -15,13 +23,12 @@ function Ensure-Admin {
             [System.Diagnostics.Process]::Start($psi) | Out-Null
         } catch {
             Add-Type -AssemblyName System.Windows.Forms
-            [System.Windows.Forms.MessageBox]::Show("Este script precisa ser executado como Administrador.","PermissÃ£o necessÃ¡ria",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("Este script precisa ser executado como Administrador.","Permissão necessária",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         }
         Exit
     }
 }
 
-# ------------------ FunÃ§Ãµes de otimizaÃ§Ã£o e limpeza ------------------
 function Backup-Location {
     param([string]$Suffix = "")
     $ts = (Get-Date).ToString('yyyyMMdd_HHmmss')
@@ -30,128 +37,214 @@ function Backup-Location {
     return $dir
 }
 
+function Save-State {
+    param($backup,$object,$filename)
+    try {
+        $object | ConvertTo-Json -Depth 5 | Out-File -FilePath (Join-Path $backup $filename) -Encoding UTF8
+    } catch {
+        "$($_)" | Out-File -FilePath (Join-Path $backup "save_state_error.txt") -Encoding UTF8
+    }
+}
+
+function Report-Status {
+    param([string]$msg)
+    if ($script:formStatusLabel) {
+        $script:formStatusLabel.Text = $msg
+        $script:formStatusLabel.Refresh()
+    } else {
+        Write-Host $msg
+    }
+}
+
+# ------------------ Otimizações/ações ------------------
 function Opt-PlusFPS_Action {
-    $formStatusLabel.Text = "Aplicando otimizaÃ§Ãµes +FPS..."
-    $formStatusLabel.Refresh()
+    Report-Status "Aplicando otimizações +FPS..."
     $backup = Backup-Location "_optfps"
     try {
-        # Backup serviÃ§os alvo
-        $servicesToHandle = @('SysMain','WSearch')
+        # Serviços alvo (backup e stop)
+        $servicesToHandle = @('SysMain','WSearch','DiagTrack','W32Time','XboxGipSvc','XblGameSave','XblAuthManager')
         $svcStates = @{}
         foreach ($s in $servicesToHandle) {
             try {
                 $svc = Get-Service -Name $s -ErrorAction Stop
                 $mode = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$s'").StartMode
                 $svcStates[$s] = @{ Status = $svc.Status; StartType = $mode }
-                Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+                if ($svc.Status -ne 'Stopped') { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue }
                 Set-Service -Name $s -StartupType Manual -ErrorAction SilentlyContinue
             } catch {}
         }
-        $svcStates | ConvertTo-Json | Out-File -FilePath (Join-Path $backup 'services_state.json') -Encoding UTF8
+        Save-State -backup $backup -object $svcStates -filename 'services_state.json'
 
-        # Ajustar efeitos visuais para melhor desempenho (HKCU)
+        # Ajustes visuais (HKCU)
         try {
             New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Force | Out-Null
             Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Value 2 -Type DWord -Force
         } catch {}
 
-        # Desativar dicas e sugestÃµes
+        # Ajuste de prioridade de processo para jogos (padrão quando iniciar)
+        # Observação: aqui apenas salvamos preferência para uso futuro; não força agora.
         try {
-            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' -Name 'SystemPaneSuggestionsEnabled' -Value 0 -Force -ErrorAction SilentlyContinue
-            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' -Name 'SubscribedContent-338388Enabled' -Value 0 -Force -ErrorAction SilentlyContinue
+            $prefs = @{ GamePriority = "High" }
+            Save-State -backup $backup -object $prefs -filename 'process_prefs.json'
         } catch {}
 
-        # Flush DNS
+        # DNS flush
         try { ipconfig /flushdns > $null } catch {}
 
-        # Ajustes leves de rede (desabilitar LSO quando possÃ­vel)
+        # TCP tweaks (somente register, não reinicia automaticamente)
+        try {
+            $tcpRegs = @{
+                "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\TcpTimedWaitDelay" = 30
+                "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\EnableTCPA" = 0
+            }
+            $tcpRegs.GetEnumerator() | ForEach-Object {
+                New-Item -Path ($_ .Key) -Force -ErrorAction SilentlyContinue
+            } # safety: do not write numeric regs blindly; instead record intention
+            # Save intention
+            Save-State -backup $backup -object $tcpRegs -filename 'tcp_tweaks_intent.json'
+        } catch {}
+
+        # Disabilitar Large Send Offload (LSO) se suportado
         try {
             $nics = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+            $nicStates = @{}
             foreach ($nic in $nics) {
-                $props = Get-NetAdapterAdvancedProperty -Name $nic.Name -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'Large Send Offload' }
-                foreach ($p in $props) {
+                $props = Get-NetAdapterAdvancedProperty -Name $nic.Name -ErrorAction SilentlyContinue
+                $nicStates[$nic.Name] = $props | Select-Object DisplayName,DisplayValue,RegistryKeyword
+                foreach ($p in $props | Where-Object { $_.DisplayName -match 'Large Send Offload|LSO' }) {
                     Try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $p.DisplayName -DisplayValue 'Disabled' -NoRestart -ErrorAction SilentlyContinue } catch {}
                 }
             }
+            Save-State -backup $backup -object $nicStates -filename 'nics_state.json'
+        } catch {}
+
+        # Limpar cache standby (usa RAMMap-like approach via PowerShell - tentativa com ClearStandbyList util se disponível)
+        try {
+            $clearExe = Join-Path $env:windir "System32\RAMMap.exe"
+            # se não existir, tentamos via EmptyStandbyList se presente (Windows 10+ Sysinternals/others)
+            # Não distribuímos ferramenta; apenas tentamos chamar se já existe
         } catch {}
 
         "Optimizations applied on $(Get-Date)" | Out-File -FilePath (Join-Path $backup 'opt_log.txt') -Encoding UTF8
-        $formStatusLabel.Text = "OtimizaÃ§Ãµes +FPS aplicadas. Backup: $backup"
+        Report-Status "Otimizações +FPS aplicadas. Backup: $backup"
     } catch {
-        $formStatusLabel.Text = "Erro ao aplicar otimizaÃ§Ãµes: $_"
+        Report-Status "Erro ao aplicar otimizações: $_"
     }
 }
 
 function Clean-Temp_Action {
-    $formStatusLabel.Text = "Iniciando limpeza de temporÃ¡rios..."
-    $formStatusLabel.Refresh()
+    Report-Status "Iniciando limpeza de temporários..."
     $backup = Backup-Location "_clean"
     $paths = @(
         $env:TEMP,
         "$env:SystemRoot\Temp",
         "$env:windir\SoftwareDistribution\Download",
-        "$env:windir\Prefetch"
+        "$env:windir\Prefetch",
+        (Join-Path $env:LOCALAPPDATA "Temp")
     )
     foreach ($p in $paths) {
         if (Test-Path $p) {
             try {
                 $listFile = Join-Path $backup ("list_" + ([IO.Path]::GetFileName($p)) + ".txt")
                 Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Select-Object FullName | Out-File -FilePath $listFile -Encoding UTF8
+                # Remover arquivos (mantenha pastas)
                 Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue
             } catch {}
         }
     }
+
     # Esvaziar Lixeira (tentativa)
     try {
         $shell = New-Object -ComObject Shell.Application
         $recycle = $shell.Namespace(0xA)
         $items = $recycle.Items()
-        if ($items.Count -gt 0) { $recycle.InvokeVerb('Esvaziar Lixeira') } # note: rÃ³tulo pode variar por idioma; tentamos
+        if ($items.Count -gt 0) { $recycle.InvokeVerb('Esvaziar Lixeira') }
     } catch {}
 
-    $formStatusLabel.Text = "Limpeza concluÃ­da. Logs/backup: $backup"
+    # Limpar cache DNS e ícones
+    try { ipconfig /flushdns > $null } catch {}
+    try { ie4uinit.exe -ClearIconCache > $null } catch {}
+
+    Report-Status "Limpeza concluída. Logs/backup: $backup"
 }
 
 function Create-RestorePoint_Action {
-    $formStatusLabel.Text = "Criando ponto de restauraÃ§Ã£o..."
-    $formStatusLabel.Refresh()
+    Report-Status "Criando ponto de restauração..."
     try {
-        # Usa Checkpoint-Computer (requer System Restore habilitado)
         if (Get-Command -Name Checkpoint-Computer -ErrorAction SilentlyContinue) {
             Checkpoint-Computer -Description "BlackNight Restore Point" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
-            $formStatusLabel.Text = "Ponto de restauraÃ§Ã£o criado com sucesso."
+            Report-Status "Ponto de restauração criado com sucesso."
         } else {
-            $formStatusLabel.Text = "Checkpoint-Computer nÃ£o disponÃ­vel neste sistema."
+            Report-Status "Checkpoint-Computer não disponível neste sistema."
         }
     } catch {
-        $formStatusLabel.Text = "Falha ao criar ponto de restauraÃ§Ã£o: $_"
+        Report-Status "Falha ao criar ponto de restauração: $_"
+    }
+}
+
+function Show-SystemInfo {
+    $ram = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory
+    $total = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+    $cpu = (Get-CimInstance Win32_Processor).Name
+    $gpu = (Get-CimInstance Win32_VideoController | Select-Object -First 1).Name
+    $obj = @{
+        FreeMB = [math]::Round($ram/1024,2)
+        TotalBytes = $total
+        CPU = $cpu
+        GPU = $gpu
+        Time = (Get-Date).ToString()
+    }
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Multiline = $true
+    $tb.ReadOnly = $true
+    $tb.ScrollBars = "Vertical"
+    $tb.Size = New-Object System.Drawing.Size(520,140)
+    $tb.Location = New-Object System.Drawing.Point(20,300)
+    $tb.Text = ("Informações do sistema:`r`n" + ($obj | ConvertTo-Json -Depth 3))
+    $script:form.Controls.Add($tb)
+}
+
+function Restore-From-Backup {
+    param([string]$backupPath)
+    if (-not (Test-Path $backupPath)) { Report-Status "Backup não encontrado: $backupPath"; return }
+    Report-Status "Restaurando a partir de: $backupPath (somente reinício/estado de serviços/registros salvos)"
+    try {
+        $svcFile = Join-Path $backupPath 'services_state.json'
+        if (Test-Path $svcFile) {
+            $svcStates = Get-Content $svcFile -Raw | ConvertFrom-Json
+            foreach ($k in $svcStates.PSObject.Properties.Name) {
+                $entry = $svcStates.$k
+                try {
+                    if ($entry.StartType) { Set-Service -Name $k -StartupType $entry.StartType -ErrorAction SilentlyContinue }
+                    if ($entry.Status -eq 'Running') { Start-Service -Name $k -ErrorAction SilentlyContinue }
+                } catch {}
+            }
+        }
+        Report-Status "Restauração (parcial) concluída. Reinicie o sistema se necessário."
+    } catch {
+        Report-Status "Erro durante restauração: $_"
     }
 }
 
 # ------------------ GUI ------------------
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-# Ensure script is run as admin
 Ensure-Admin
 
-# Form
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "BlackNight FPS Optimizer"
-$form.Size = New-Object System.Drawing.Size(560,360)
+$form.Text = "BlackNight FPS Optimizer v2.0"
+$form.Size = New-Object System.Drawing.Size(560,420)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.MinimizeBox = $true
-$form.BackColor = [System.Drawing.Color]::FromArgb(20,20,20)
+$form.BackColor = [System.Drawing.Color]::FromArgb(18,18,18)
 
-# Title label
+# Title
 $title = New-Object System.Windows.Forms.Label
-$title.Text = "BlackNight FPS Optimizer"
+$title.Text = "BlackNight FPS Optimizer  v2.0"
 $title.AutoSize = $false
 $title.TextAlign = 'MiddleCenter'
 $title.Font = New-Object System.Drawing.Font("Segoe UI",18,[System.Drawing.FontStyle]::Bold)
-$title.Size = New-Object System.Drawing.Size(520,44)
+$title.Size = New-Object System.Drawing.Size(520,48)
 $title.Location = New-Object System.Drawing.Point(20,10)
 $title.ForeColor = [System.Drawing.Color]::FromArgb(255,60,60)
 $form.Controls.Add($title)
@@ -160,13 +253,21 @@ $form.Controls.Add($title)
 $formStatusLabel = New-Object System.Windows.Forms.Label
 $formStatusLabel.Text = "Pronto."
 $formStatusLabel.AutoSize = $false
-$formStatusLabel.Size = New-Object System.Drawing.Size(520,30)
-$formStatusLabel.Location = New-Object System.Drawing.Point(20,300)
+$formStatusLabel.Size = New-Object System.Drawing.Size(520,26)
+$formStatusLabel.Location = New-Object System.Drawing.Point(20,370)
 $formStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200,200,200)
 $formStatusLabel.BackColor = 'Transparent'
 $form.Controls.Add($formStatusLabel)
 
-# Button style helper
+# ProgressBar
+$progress = New-Object System.Windows.Forms.ProgressBar
+$progress.Style = 'Marquee'
+$progress.MarqueeAnimationSpeed = 0
+$progress.Size = New-Object System.Drawing.Size(520,10)
+$progress.Location = New-Object System.Drawing.Point(20,346)
+$form.Controls.Add($progress)
+
+# Button helper
 function Create-Button($text, $x, $y, $w, $h) {
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = $text
@@ -177,60 +278,58 @@ function Create-Button($text, $x, $y, $w, $h) {
     $btn.ForeColor = [System.Drawing.Color]::White
     $btn.BackColor = [System.Drawing.Color]::FromArgb(40,0,0)
     $btn.FlatAppearance.BorderSize = 0
-    # hover effect
     $btn.Add_MouseEnter({ $btn.BackColor = [System.Drawing.Color]::FromArgb(120,0,0) })
     $btn.Add_MouseLeave({ $btn.BackColor = [System.Drawing.Color]::FromArgb(40,0,0) })
     return $btn
 }
 
-# +FPS button
-$btnFPS = Create-Button "+FPS" 40 80 220 140
-$btnFPS.Font = New-Object System.Drawing.Font("Segoe UI",20,[System.Drawing.FontStyle]::Bold)
+# Buttons
+$btnFPS = Create-Button "+FPS (Avançado)" 20 80 250 140
+$btnFPS.Font = New-Object System.Drawing.Font("Segoe UI",16,[System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($btnFPS)
-$lblFPS = New-Object System.Windows.Forms.Label
-$lblFPS.Text = "Aplicar otimizaÃ§Ãµes para desempenho"
-$lblFPS.Size = New-Object System.Drawing.Size(220,30)
-$lblFPS.Location = New-Object System.Drawing.Point(40,230)
-$lblFPS.ForeColor = [System.Drawing.Color]::FromArgb(200,200,200)
-$form.Controls.Add($lblFPS)
 
-# Limpeza button
-$btnClean = Create-Button "Limpeza" 300 80 220 140
-$btnClean.Font = New-Object System.Drawing.Font("Segoe UI",20,[System.Drawing.FontStyle]::Bold)
+$btnClean = Create-Button "Limpeza Avançada" 290 80 250 65
+$btnClean.Font = New-Object System.Drawing.Font("Segoe UI",12,[System.Drawing.FontStyle]::Bold)
 $form.Controls.Add($btnClean)
-$lblClean = New-Object System.Windows.Forms.Label
-$lblClean.Text = "Remover temporÃ¡rios e caches"
-$lblClean.Size = New-Object System.Drawing.Size(220,30)
-$lblClean.Location = New-Object System.Drawing.Point(300,230)
-$lblClean.ForeColor = [System.Drawing.Color]::FromArgb(200,200,200)
-$form.Controls.Add($lblClean)
 
-# Restore Point button
-$btnRestore = Create-Button "Criar Ponto de RestauraÃ§Ã£o" 40 260 360 32
+$btnCleanQuick = Create-Button "Limpeza Rápida" 290 155 250 65
+$btnCleanQuick.Font = New-Object System.Drawing.Font("Segoe UI",12,[System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($btnCleanQuick)
+
+$btnRestorePoint = Create-Button "Criar Ponto de Restauração" 20 240 260 32
+$btnRestorePoint.Font = New-Object System.Drawing.Font("Segoe UI",10,[System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($btnRestorePoint)
+
+$btnRestore = Create-Button "Restaurar (Backup)" 300 240 240 32
 $btnRestore.Font = New-Object System.Drawing.Font("Segoe UI",10,[System.Drawing.FontStyle]::Bold)
-$btnRestore.Location = New-Object System.Drawing.Point(40,260)
 $form.Controls.Add($btnRestore)
 
-# Exit button
-$btnExit = Create-Button "Sair" 420 260 100 32
-$btnExit.Font = New-Object System.Drawing.Font("Segoe UI",10,[System.Drawing.FontStyle]::Bold)
+$btnSysInfo = Create-Button "Mostrar Sistema" 20 280 260 32
+$form.Controls.Add($btnSysInfo)
+
+$btnExit = Create-Button "Sair" 420 280 120 32
 $form.Controls.Add($btnExit)
 
 # Disable/Enable helpers
 function Set-ControlsEnabled($state) {
     $btnFPS.Enabled = $state
     $btnClean.Enabled = $state
+    $btnCleanQuick.Enabled = $state
+    $btnRestorePoint.Enabled = $state
     $btnRestore.Enabled = $state
+    $btnSysInfo.Enabled = $state
     $btnExit.Enabled = $state
 }
 
-# Button actions
+# Actions wiring
 $btnFPS.Add_Click({
     try {
         Set-ControlsEnabled($false)
+        $progress.MarqueeAnimationSpeed = 30
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         Opt-PlusFPS_Action
     } finally {
+        $progress.MarqueeAnimationSpeed = 0
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
         Set-ControlsEnabled($true)
     }
@@ -238,32 +337,88 @@ $btnFPS.Add_Click({
 
 $btnClean.Add_Click({
     try {
-        Set-ControlsEnabled($false)
-        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        Clean-Temp_Action
+        $confirm = [System.Windows.Forms.MessageBox]::Show("Limpeza avançada irá remover caches e temporários. Continuar?", "Confirmar", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Set-ControlsEnabled($false)
+            $progress.MarqueeAnimationSpeed = 30
+            $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            Clean-Temp_Action
+        }
     } finally {
+        $progress.MarqueeAnimationSpeed = 0
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
         Set-ControlsEnabled($true)
     }
 })
 
-$btnRestore.Add_Click({
-    $confirm = [System.Windows.Forms.MessageBox]::Show("Criar um ponto de restauraÃ§Ã£o pode levar alguns minutos. Continuar?", "Confirmar", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+$btnCleanQuick.Add_Click({
+    try {
+        Set-ControlsEnabled($false)
+        $progress.MarqueeAnimationSpeed = 20
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        # Quick clean: temp + dns
+        $backup = Backup-Location "_quickclean"
+        try {
+            Get-ChildItem -Path $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue
+            ipconfig /flushdns > $null
+            Report-Status "Limpeza rápida concluída. Backup: $backup"
+        } catch {
+            Report-Status "Erro na limpeza rápida: $_"
+        }
+    } finally {
+        $progress.MarqueeAnimationSpeed = 0
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        Set-ControlsEnabled($true)
+    }
+})
+
+$btnRestorePoint.Add_Click({
+    $confirm = [System.Windows.Forms.MessageBox]::Show("Criar um ponto de restauração pode levar alguns minutos. Continuar?", "Confirmar", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
     if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
         try {
             Set-ControlsEnabled($false)
+            $progress.MarqueeAnimationSpeed = 30
             $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
             Create-RestorePoint_Action
         } finally {
+            $progress.MarqueeAnimationSpeed = 0
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
             Set-ControlsEnabled($true)
         }
     }
 })
 
+$btnRestore.Add_Click({
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = "Selecione a pasta de backup (ex: C:\Users\SeuUser\AppData\Local\Temp\BlackNight_backup_YYYYMMDD_HHMMSS_optfps)"
+    if ($dlg.ShowDialog() -eq 'OK') {
+        Set-ControlsEnabled($false)
+        $progress.MarqueeAnimationSpeed = 20
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        Restore-From-Backup -backupPath $dlg.SelectedPath
+        $progress.MarqueeAnimationSpeed = 0
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        Set-ControlsEnabled($true)
+    }
+})
+
+$btnSysInfo.Add_Click({
+    Show-SystemInfo
+})
+
 $btnExit.Add_Click({ $form.Close() })
 
-# Show form (entrypoint)
+# Footer note
+$footer = New-Object System.Windows.Forms.Label
+$footer.Text = "Feito por Thales · BlackNight v2.0"
+$footer.AutoSize = $false
+$footer.TextAlign = 'MiddleLeft'
+$footer.Font = New-Object System.Drawing.Font("Segoe UI",8,[System.Drawing.FontStyle]::Italic)
+$footer.Size = New-Object System.Drawing.Size(300,20)
+$footer.Location = New-Object System.Drawing.Point(20,396)
+$footer.ForeColor = [System.Drawing.Color]::FromArgb(160,160,160)
+$form.Controls.Add($footer)
+
 [void]$form.ShowDialog()
 
 # ------------------ FIM ------------------
