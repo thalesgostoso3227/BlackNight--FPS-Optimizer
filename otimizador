@@ -1,424 +1,336 @@
-
-# BlackNight FPS Optimizer v2.0 - GUI (preto e vermelho)
-# Salve como BlackNight_GUI_v2.ps1 e execute como Administrador (PowerShell 5+)
-# Autor: gerado para thales (versão aprimorada)
-# NOTAS IMPORTANTES:
-#  - Faz backups simples em %TEMP% antes de alterações.
-#  - Inclui opção de restaurar configurações anteriores.
-#  - Não altera permanentemente planos de energia sem avisar (opcional).
-#  - Use por sua conta: teste em ambiente controlado. O script tenta operar de forma segura.
+<#
+.SYNOPSIS
+  BlackNight GUI - Otimizar o Windows (Interativo, Tema Escuro)
+.DESCRIPTION
+  Versão final pronta para execução e upload no GitHub.
+  - Botão "Otimizar o Windows" abre uma janela interativa com ações seguras e com confirmação antes de cada passo.
+  - Ações implementadas:
+      * Limpar Temporários (%TEMP%, C:\Windows\Temp, AppData\Local\Temp)
+      * Limpar cache do Chrome/Edge (padrão)
+      * Esvaziar Lixeira (via Shell COM)
+      * Limpar cache do Windows Update (SoftwareDistribution\Download) — requer Administrador
+      * Abrir Gerenciador de Tarefas (sugestão para aba Inicializar)
+  - Tema: BlackNight (escuro)
+  - Para executar via PowerShell: execute o arquivo com PowerShell (recomenda-se executar como Administrador para todas as ações funcionarem).
+  - Para rodar direto do GitHub com Invoke-RestMethod: 
+      iex (irm "https://raw.githubusercontent.com/SeuUsuario/SeuRepo/main/BlackNight_GUI.ps1")
+#>
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# ------------------ Helpers ------------------
+# --- Helpers ---
 function Ensure-Admin {
-    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isAdmin) {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = (Get-Process -Id $PID).Path
-        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-        $psi.Verb = "runas"
-        try {
-            [System.Diagnostics.Process]::Start($psi) | Out-Null
-        } catch {
-            Add-Type -AssemblyName System.Windows.Forms
-            [System.Windows.Forms.MessageBox]::Show("Este script precisa ser executado como Administrador.","Permissão necessária",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
-        }
-        Exit
-    }
+    $current = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($current)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Backup-Location {
-    param([string]$Suffix = "")
-    $ts = (Get-Date).ToString('yyyyMMdd_HHmmss')
-    $dir = Join-Path $env:TEMP ("BlackNight_backup_$ts$Suffix")
-    New-Item -Path $dir -ItemType Directory -Force | Out-Null
-    return $dir
+function Show-Message($text, $title="BlackNight") {
+    [System.Windows.Forms.MessageBox]::Show($text, $title, 'OK', 'Information') | Out-Null
 }
 
-function Save-State {
-    param($backup,$object,$filename)
+function Confirm-Action($text, $title="Confirmação") {
+    $res = [System.Windows.Forms.MessageBox]::Show($text, $title, 'YesNo', 'Question')
+    return $res -eq [System.Windows.Forms.DialogResult]::Yes
+}
+
+# --- Optimization Functions ---
+
+function Remove-ItemSafe($path) {
     try {
-        $object | ConvertTo-Json -Depth 5 | Out-File -FilePath (Join-Path $backup $filename) -Encoding UTF8
-    } catch {
-        "$($_)" | Out-File -FilePath (Join-Path $backup "save_state_error.txt") -Encoding UTF8
-    }
-}
-
-function Report-Status {
-    param([string]$msg)
-    if ($script:formStatusLabel) {
-        $script:formStatusLabel.Text = $msg
-        $script:formStatusLabel.Refresh()
-    } else {
-        Write-Host $msg
-    }
-}
-
-# ------------------ Otimizações/ações ------------------
-function Opt-PlusFPS_Action {
-    Report-Status "Aplicando otimizações +FPS..."
-    $backup = Backup-Location "_optfps"
-    try {
-        # Serviços alvo (backup e stop)
-        $servicesToHandle = @('SysMain','WSearch','DiagTrack','W32Time','XboxGipSvc','XblGameSave','XblAuthManager')
-        $svcStates = @{}
-        foreach ($s in $servicesToHandle) {
-            try {
-                $svc = Get-Service -Name $s -ErrorAction Stop
-                $mode = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$s'").StartMode
-                $svcStates[$s] = @{ Status = $svc.Status; StartType = $mode }
-                if ($svc.Status -ne 'Stopped') { Stop-Service -Name $s -Force -ErrorAction SilentlyContinue }
-                Set-Service -Name $s -StartupType Manual -ErrorAction SilentlyContinue
-            } catch {}
-        }
-        Save-State -backup $backup -object $svcStates -filename 'services_state.json'
-
-        # Ajustes visuais (HKCU)
-        try {
-            New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Force | Out-Null
-            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Value 2 -Type DWord -Force
-        } catch {}
-
-        # Ajuste de prioridade de processo para jogos (padrão quando iniciar)
-        # Observação: aqui apenas salvamos preferência para uso futuro; não força agora.
-        try {
-            $prefs = @{ GamePriority = "High" }
-            Save-State -backup $backup -object $prefs -filename 'process_prefs.json'
-        } catch {}
-
-        # DNS flush
-        try { ipconfig /flushdns > $null } catch {}
-
-        # TCP tweaks (somente register, não reinicia automaticamente)
-        try {
-            $tcpRegs = @{
-                "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\TcpTimedWaitDelay" = 30
-                "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\EnableTCPA" = 0
+        if (Test-Path $path) {
+            Get-ChildItem -LiteralPath $path -Force -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                try { Remove-Item -LiteralPath $_.FullName -Force -Recurse -ErrorAction SilentlyContinue } catch {}
             }
-            $tcpRegs.GetEnumerator() | ForEach-Object {
-                New-Item -Path ($_ .Key) -Force -ErrorAction SilentlyContinue
-            } # safety: do not write numeric regs blindly; instead record intention
-            # Save intention
-            Save-State -backup $backup -object $tcpRegs -filename 'tcp_tweaks_intent.json'
-        } catch {}
-
-        # Disabilitar Large Send Offload (LSO) se suportado
-        try {
-            $nics = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
-            $nicStates = @{}
-            foreach ($nic in $nics) {
-                $props = Get-NetAdapterAdvancedProperty -Name $nic.Name -ErrorAction SilentlyContinue
-                $nicStates[$nic.Name] = $props | Select-Object DisplayName,DisplayValue,RegistryKeyword
-                foreach ($p in $props | Where-Object { $_.DisplayName -match 'Large Send Offload|LSO' }) {
-                    Try { Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName $p.DisplayName -DisplayValue 'Disabled' -NoRestart -ErrorAction SilentlyContinue } catch {}
-                }
-            }
-            Save-State -backup $backup -object $nicStates -filename 'nics_state.json'
-        } catch {}
-
-        # Limpar cache standby (usa RAMMap-like approach via PowerShell - tentativa com ClearStandbyList util se disponível)
-        try {
-            $clearExe = Join-Path $env:windir "System32\RAMMap.exe"
-            # se não existir, tentamos via EmptyStandbyList se presente (Windows 10+ Sysinternals/others)
-            # Não distribuímos ferramenta; apenas tentamos chamar se já existe
-        } catch {}
-
-        "Optimizations applied on $(Get-Date)" | Out-File -FilePath (Join-Path $backup 'opt_log.txt') -Encoding UTF8
-        Report-Status "Otimizações +FPS aplicadas. Backup: $backup"
+            return $true
+        }
+        return $false
     } catch {
-        Report-Status "Erro ao aplicar otimizações: $_"
+        return $false
     }
 }
 
-function Clean-Temp_Action {
-    Report-Status "Iniciando limpeza de temporários..."
-    $backup = Backup-Location "_clean"
-    $paths = @(
-        $env:TEMP,
-        "$env:SystemRoot\Temp",
-        "$env:windir\SoftwareDistribution\Download",
-        "$env:windir\Prefetch",
-        (Join-Path $env:LOCALAPPDATA "Temp")
-    )
-    foreach ($p in $paths) {
-        if (Test-Path $p) {
-            try {
-                $listFile = Join-Path $backup ("list_" + ([IO.Path]::GetFileName($p)) + ".txt")
-                Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Select-Object FullName | Out-File -FilePath $listFile -Encoding UTF8
-                # Remover arquivos (mantenha pastas)
-                Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue
-            } catch {}
-        }
-    }
-
-    # Esvaziar Lixeira (tentativa)
+function Clean-Temp {
     try {
+        $paths = @(
+            [IO.Path]::GetTempPath(),
+            "C:\Windows\Temp",
+            Join-Path $env:LOCALAPPDATA "Temp"
+        ) | Select-Object -Unique
+
+        $summary = @()
+        if (-not (Confirm-Action "Deseja limpar as pastas temporárias?`n`n$($paths -join \"`n\")")) { return }
+
+        foreach ($p in $paths) {
+            if (Test-Path $p) {
+                $countBefore = (Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+                Remove-ItemSafe -path $p | Out-Null
+                $countAfter = (Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+                $removed = $countBefore - $countAfter
+                $summary += "$p : ~${removed} itens removidos"
+            } else {
+                $summary += "$p : (não encontrado)"
+            }
+        }
+
+        Show-Message ("Limpeza concluída.`n`n" + ($summary -join "`n"))
+    }
+    catch {
+        Show-Message "Erro ao limpar temporários:`n$($_.Exception.Message)"
+    }
+}
+
+function Clear-BrowserCache {
+    try {
+        if (-not (Confirm-Action "Deseja tentar limpar o cache do Chrome e do Edge (padrões)?`n(será feita tentativa nas pastas padrão de perfil)")) { return }
+        $removed = @()
+        # Chrome Default
+        $chromeCache = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default\Cache"
+        $chromeGPUCache = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\Default\GPUCache"
+        # Edge Default
+        $edgeCache = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\Cache"
+        $edgeGPUCache = Join-Path $env:LOCALAPPDATA "Microsoft\Edge\User Data\Default\GPUCache"
+
+        $candidates = @($chromeCache, $chromeGPUCache, $edgeCache, $edgeGPUCache) | Select-Object -Unique
+        foreach ($c in $candidates) {
+            if (Test-Path $c) {
+                $countBefore = (Get-ChildItem -Path $c -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+                Remove-ItemSafe -path $c | Out-Null
+                $countAfter = (Get-ChildItem -Path $c -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+                $removed += "$c : ~$($countBefore - $countAfter) itens removidos"
+            } else {
+                $removed += "$c : (não encontrado)"
+            }
+        }
+
+        Show-Message ("Limpeza de cache de navegadores concluída.`n`n" + ($removed -join "`n"))
+    }
+    catch {
+        Show-Message "Erro ao limpar cache do navegador:`n$($_.Exception.Message)"
+    }
+}
+
+function Empty-RecycleBin {
+    try {
+        if (-not (Confirm-Action "Deseja esvaziar a Lixeira?")) { return }
         $shell = New-Object -ComObject Shell.Application
         $recycle = $shell.Namespace(0xA)
-        $items = $recycle.Items()
-        if ($items.Count -gt 0) { $recycle.InvokeVerb('Esvaziar Lixeira') }
-    } catch {}
-
-    # Limpar cache DNS e ícones
-    try { ipconfig /flushdns > $null } catch {}
-    try { ie4uinit.exe -ClearIconCache > $null } catch {}
-
-    Report-Status "Limpeza concluída. Logs/backup: $backup"
+        # Invoke "Empty Recycle Bin" - may show native UI depending on system
+        $recycle.InvokeVerb("Esvaziar Lixeira")
+        Show-Message "Comando para esvaziar a lixeira enviado ao Shell."
+    }
+    catch {
+        Show-Message "Erro ao esvaziar Lixeira:`n$($_.Exception.Message)"
+    }
 }
 
-function Create-RestorePoint_Action {
-    Report-Status "Criando ponto de restauração..."
+function Clear-WindowsUpdateCache {
     try {
-        if (Get-Command -Name Checkpoint-Computer -ErrorAction SilentlyContinue) {
-            Checkpoint-Computer -Description "BlackNight Restore Point" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
-            Report-Status "Ponto de restauração criado com sucesso."
-        } else {
-            Report-Status "Checkpoint-Computer não disponível neste sistema."
+        if (-not (Confirm-Action "Limpar cache do Windows Update (SoftwareDistribution\\Download)?`n(necessita privilégios de Administrador)")) { return }
+        if (-not (Ensure-Admin)) {
+            Show-Message "Este passo requer execução como Administrador. Reinicie o PowerShell como Administrador e tente novamente."
+            return
         }
-    } catch {
-        Report-Status "Falha ao criar ponto de restauração: $_"
+        Try { Stop-Service -Name wuauserv -Force -ErrorAction Stop } catch {}
+        $path = Join-Path $env:SystemRoot "SoftwareDistribution\Download"
+        if (Test-Path $path) {
+            $countBefore = (Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+            Remove-ItemSafe -path $path | Out-Null
+            $countAfter = (Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+            $removed = $countBefore - $countAfter
+            Show-Message "Cache do Windows Update limpo. ~${removed} itens removidos."
+        } else {
+            Show-Message "Pasta de cache não encontrada: $path"
+        }
+        Try { Start-Service -Name wuauserv -ErrorAction Stop } catch {}
+    }
+    catch {
+        Show-Message "Erro ao limpar cache do Windows Update:`n$($_.Exception.Message)"
     }
 }
 
-function Show-SystemInfo {
-    $ram = (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory
-    $total = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
-    $cpu = (Get-CimInstance Win32_Processor).Name
-    $gpu = (Get-CimInstance Win32_VideoController | Select-Object -First 1).Name
-    $obj = @{
-        FreeMB = [math]::Round($ram/1024,2)
-        TotalBytes = $total
-        CPU = $cpu
-        GPU = $gpu
-        Time = (Get-Date).ToString()
-    }
-    $tb = New-Object System.Windows.Forms.TextBox
-    $tb.Multiline = $true
-    $tb.ReadOnly = $true
-    $tb.ScrollBars = "Vertical"
-    $tb.Size = New-Object System.Drawing.Size(520,140)
-    $tb.Location = New-Object System.Drawing.Point(20,300)
-    $tb.Text = ("Informações do sistema:`r`n" + ($obj | ConvertTo-Json -Depth 3))
-    $script:form.Controls.Add($tb)
-}
-
-function Restore-From-Backup {
-    param([string]$backupPath)
-    if (-not (Test-Path $backupPath)) { Report-Status "Backup não encontrado: $backupPath"; return }
-    Report-Status "Restaurando a partir de: $backupPath (somente reinício/estado de serviços/registros salvos)"
+function Open-Startup-Manager {
     try {
-        $svcFile = Join-Path $backupPath 'services_state.json'
-        if (Test-Path $svcFile) {
-            $svcStates = Get-Content $svcFile -Raw | ConvertFrom-Json
-            foreach ($k in $svcStates.PSObject.Properties.Name) {
-                $entry = $svcStates.$k
-                try {
-                    if ($entry.StartType) { Set-Service -Name $k -StartupType $entry.StartType -ErrorAction SilentlyContinue }
-                    if ($entry.Status -eq 'Running') { Start-Service -Name $k -ErrorAction SilentlyContinue }
-                } catch {}
+        if (Confirm-Action "Deseja abrir o Gerenciador de Tarefas (você pode gerenciar itens de Inicialização na aba 'Inicializar')?") {
+            Start-Process "taskmgr"
+            Show-Message "Gerenciador de Tarefas aberto. Navegue até a aba 'Inicializar' para gerenciar programas."
+        }
+    }
+    catch {
+        Show-Message "Erro ao abrir Gerenciador de Tarefas:`n$($_.Exception.Message)"
+    }
+}
+
+function Show-Startup-Items {
+    try {
+        # Enumerate common Run keys (HKCU and HKLM)
+        $items = @()
+        $runHKCU = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+        $runHKLM = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+
+        foreach ($k in @($runHKCU, $runHKLM)) {
+            if (Test-Path $k) {
+                Get-ItemProperty -Path $k | ForEach-Object {
+                    $_.PSObject.Properties | Where-Object { $_.Name -ne "PSPath" -and $_.Name -ne "PSParentPath" -and $_.Name -ne "PSChildName" -and $_.Name -ne "PSDrive" -and $_.Name -ne "PSProvider" } | ForEach-Object {
+                        $items += "$k\$($_.Name) => $($_.Value)"
+                    }
+                }
             }
         }
-        Report-Status "Restauração (parcial) concluída. Reinicie o sistema se necessário."
-    } catch {
-        Report-Status "Erro durante restauração: $_"
+
+        if ($items.Count -eq 0) {
+            Show-Message "Nenhum item de inicialização encontrado nos locais pesquisados."
+        } else {
+            $text = "Itens de inicialização encontrados:`n`n" + ($items -join "`n`n")
+            [System.Windows.Forms.Clipboard]::SetText($text)
+            Show-Message "Lista de itens de inicialização copiada para a área de transferência. Cole em um editor para revisar."
+        }
+    }
+    catch {
+        Show-Message "Erro ao listar itens de inicialização:`n$($_.Exception.Message)"
     }
 }
 
-# ------------------ GUI ------------------
-Ensure-Admin
+# --- Build Optimize Window (Dark Theme) ---
+function Show-OptimizeWindow {
+    $optForm = New-Object System.Windows.Forms.Form
+    $optForm.Text = "Otimizar o Windows - BlackNight"
+    $optForm.Size = New-Object System.Drawing.Size(480,320)
+    $optForm.StartPosition = "CenterParent"
+    $optForm.FormBorderStyle = "FixedDialog"
+    $optForm.MaximizeBox = $false
+    $optForm.MinimizeBox = $false
+    $optForm.BackColor = [System.Drawing.Color]::FromArgb(24,24,24)
 
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.AutoSize = $true
+    $lbl.Location = New-Object System.Drawing.Point(14,12)
+    $lbl.ForeColor = [System.Drawing.Color]::White
+    $lbl.Text = "Escolha a ação de otimização que deseja executar:"
+    $optForm.Controls.Add($lbl)
+
+    $btnCleanTemp = New-Object System.Windows.Forms.Button
+    $btnCleanTemp.Location = New-Object System.Drawing.Point(18,50)
+    $btnCleanTemp.Size = New-Object System.Drawing.Size(220,44)
+    $btnCleanTemp.Text = "🧹 Limpar Temporários"
+    $btnCleanTemp.FlatStyle = 'System'
+    $btnCleanTemp.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+    $btnCleanTemp.ForeColor = [System.Drawing.Color]::White
+    $btnCleanTemp.Add_Click({ Clean-Temp })
+    $optForm.Controls.Add($btnCleanTemp)
+
+    $btnBrowser = New-Object System.Windows.Forms.Button
+    $btnBrowser.Location = New-Object System.Drawing.Point(250,50)
+    $btnBrowser.Size = New-Object System.Drawing.Size(200,44)
+    $btnBrowser.Text = "🌐 Limpar Cache do Navegador"
+    $btnBrowser.FlatStyle = 'System'
+    $btnBrowser.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+    $btnBrowser.ForeColor = [System.Drawing.Color]::White
+    $btnBrowser.Add_Click({ Clear-BrowserCache })
+    $optForm.Controls.Add($btnBrowser)
+
+    $btnEmptyRecycle = New-Object System.Windows.Forms.Button
+    $btnEmptyRecycle.Location = New-Object System.Drawing.Point(18,110)
+    $btnEmptyRecycle.Size = New-Object System.Drawing.Size(220,44)
+    $btnEmptyRecycle.Text = "🗑️ Esvaziar Lixeira"
+    $btnEmptyRecycle.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+    $btnEmptyRecycle.ForeColor = [System.Drawing.Color]::White
+    $btnEmptyRecycle.Add_Click({ Empty-RecycleBin })
+    $optForm.Controls.Add($btnEmptyRecycle)
+
+    $btnClearWU = New-Object System.Windows.Forms.Button
+    $btnClearWU.Location = New-Object System.Drawing.Point(250,110)
+    $btnClearWU.Size = New-Object System.Drawing.Size(200,44)
+    $btnClearWU.Text = "📥 Limpar cache do Windows Update"
+    $btnClearWU.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+    $btnClearWU.ForeColor = [System.Drawing.Color]::White
+    $btnClearWU.Add_Click({ Clear-WindowsUpdateCache })
+    $optForm.Controls.Add($btnClearWU)
+
+    $btnStartup = New-Object System.Windows.Forms.Button
+    $btnStartup.Location = New-Object System.Drawing.Point(18,170)
+    $btnStartup.Size = New-Object System.Drawing.Size(220,44)
+    $btnStartup.Text = "🚀 Abrir Gerenciador de Tarefas"
+    $btnStartup.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+    $btnStartup.ForeColor = [System.Drawing.Color]::White
+    $btnStartup.Add_Click({ Open-Startup-Manager })
+    $optForm.Controls.Add($btnStartup)
+
+    $btnListStartup = New-Object System.Windows.Forms.Button
+    $btnListStartup.Location = New-Object System.Drawing.Point(250,170)
+    $btnListStartup.Size = New-Object System.Drawing.Size(200,44)
+    $btnListStartup.Text = "📋 Listar Itens de Inicialização"
+    $btnListStartup.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+    $btnListStartup.ForeColor = [System.Drawing.Color]::White
+    $btnListStartup.Add_Click({ Show-Startup-Items })
+    $optForm.Controls.Add($btnListStartup)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Location = New-Object System.Drawing.Point(180,240)
+    $btnClose.Size = New-Object System.Drawing.Size(120,36)
+    $btnClose.Text = "Fechar"
+    $btnClose.BackColor = [System.Drawing.Color]::FromArgb(60,60,60)
+    $btnClose.ForeColor = [System.Drawing.Color]::White
+    $btnClose.Add_Click({ $optForm.Close() })
+    $optForm.Controls.Add($btnClose)
+
+    $optForm.ShowDialog() | Out-Null
+}
+
+# --- MAIN GUI (BlackNight style) ---
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "BlackNight FPS Optimizer v2.0"
-$form.Size = New-Object System.Drawing.Size(560,420)
+$form.Text = "BlackNight - Painel"
+$form.Size = New-Object System.Drawing.Size(680,460)
 $form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = 'FixedDialog'
-$form.MaximizeBox = $false
-$form.MinimizeBox = $true
-$form.BackColor = [System.Drawing.Color]::FromArgb(18,18,18)
+$form.BackColor = [System.Drawing.Color]::FromArgb(12,12,12)
 
-# Title
-$title = New-Object System.Windows.Forms.Label
-$title.Text = "BlackNight FPS Optimizer  v2.0"
-$title.AutoSize = $false
-$title.TextAlign = 'MiddleCenter'
-$title.Font = New-Object System.Drawing.Font("Segoe UI",18,[System.Drawing.FontStyle]::Bold)
-$title.Size = New-Object System.Drawing.Size(520,48)
-$title.Location = New-Object System.Drawing.Point(20,10)
-$title.ForeColor = [System.Drawing.Color]::FromArgb(255,60,60)
-$form.Controls.Add($title)
+# Title label
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = "BlackNight - Painel"
+$lblTitle.Font = New-Object System.Drawing.Font("Segoe UI",18,[System.Drawing.FontStyle]::Bold)
+$lblTitle.AutoSize = $true
+$lblTitle.Location = New-Object System.Drawing.Point(18,14)
+$lblTitle.ForeColor = [System.Drawing.Color]::White
+$form.Controls.Add($lblTitle)
 
-# Status label
-$formStatusLabel = New-Object System.Windows.Forms.Label
-$formStatusLabel.Text = "Pronto."
-$formStatusLabel.AutoSize = $false
-$formStatusLabel.Size = New-Object System.Drawing.Size(520,26)
-$formStatusLabel.Location = New-Object System.Drawing.Point(20,370)
-$formStatusLabel.ForeColor = [System.Drawing.Color]::FromArgb(200,200,200)
-$formStatusLabel.BackColor = 'Transparent'
-$form.Controls.Add($formStatusLabel)
+# Subtitle
+$lblSub = New-Object System.Windows.Forms.Label
+$lblSub.Text = "Painel de ferramentas — clique nas opções abaixo."
+$lblSub.Font = New-Object System.Drawing.Font("Segoe UI",9,[System.Drawing.FontStyle]::Regular)
+$lblSub.AutoSize = $true
+$lblSub.Location = New-Object System.Drawing.Point(20,50)
+$lblSub.ForeColor = [System.Drawing.Color]::Gray
+$form.Controls.Add($lblSub)
 
-# ProgressBar
-$progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Style = 'Marquee'
-$progress.MarqueeAnimationSpeed = 0
-$progress.Size = New-Object System.Drawing.Size(520,10)
-$progress.Location = New-Object System.Drawing.Point(20,346)
-$form.Controls.Add($progress)
+# Example button (placeholder)
+$btnExample = New-Object System.Windows.Forms.Button
+$btnExample.Location = New-Object System.Drawing.Point(18,90)
+$btnExample.Size = New-Object System.Drawing.Size(200,44)
+$btnExample.Text = "Exemplo: Outra Opção"
+$btnExample.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+$btnExample.ForeColor = [System.Drawing.Color]::White
+$btnExample.Add_Click({ Show-Message "Clique detectado em outra opção." })
+$form.Controls.Add($btnExample)
 
-# Button helper
-function Create-Button($text, $x, $y, $w, $h) {
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = $text
-    $btn.Size = New-Object System.Drawing.Size($w,$h)
-    $btn.Location = New-Object System.Drawing.Point($x,$y)
-    $btn.FlatStyle = 'Flat'
-    $btn.Font = New-Object System.Drawing.Font("Segoe UI",11,[System.Drawing.FontStyle]::Bold)
-    $btn.ForeColor = [System.Drawing.Color]::White
-    $btn.BackColor = [System.Drawing.Color]::FromArgb(40,0,0)
-    $btn.FlatAppearance.BorderSize = 0
-    $btn.Add_MouseEnter({ $btn.BackColor = [System.Drawing.Color]::FromArgb(120,0,0) })
-    $btn.Add_MouseLeave({ $btn.BackColor = [System.Drawing.Color]::FromArgb(40,0,0) })
-    return $btn
-}
+# Optimize button
+$btnOptimize = New-Object System.Windows.Forms.Button
+$btnOptimize.Location = New-Object System.Drawing.Point(240,90)
+$btnOptimize.Size = New-Object System.Drawing.Size(260,44)
+$btnOptimize.Text = "Otimizar o Windows"
+$btnOptimize.BackColor = [System.Drawing.Color]::FromArgb(40,40,40)
+$btnOptimize.ForeColor = [System.Drawing.Color]::White
+$btnOptimize.Font = New-Object System.Drawing.Font("Segoe UI",10,[System.Drawing.FontStyle]::Bold)
+$btnOptimize.Add_Click({ Show-OptimizeWindow })
+$form.Controls.Add($btnOptimize)
 
-# Buttons
-$btnFPS = Create-Button "+FPS (Avançado)" 20 80 250 140
-$btnFPS.Font = New-Object System.Drawing.Font("Segoe UI",16,[System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($btnFPS)
+# Status bar
+$status = New-Object System.Windows.Forms.StatusStrip
+$statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
+$statusLabel.Text = "Pronto"
+$statusLabel.ForeColor = [System.Drawing.Color]::White
+$status.Items.Add($statusLabel) | Out-Null
+$form.Controls.Add($status)
 
-$btnClean = Create-Button "Limpeza Avançada" 290 80 250 65
-$btnClean.Font = New-Object System.Drawing.Font("Segoe UI",12,[System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($btnClean)
-
-$btnCleanQuick = Create-Button "Limpeza Rápida" 290 155 250 65
-$btnCleanQuick.Font = New-Object System.Drawing.Font("Segoe UI",12,[System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($btnCleanQuick)
-
-$btnRestorePoint = Create-Button "Criar Ponto de Restauração" 20 240 260 32
-$btnRestorePoint.Font = New-Object System.Drawing.Font("Segoe UI",10,[System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($btnRestorePoint)
-
-$btnRestore = Create-Button "Restaurar (Backup)" 300 240 240 32
-$btnRestore.Font = New-Object System.Drawing.Font("Segoe UI",10,[System.Drawing.FontStyle]::Bold)
-$form.Controls.Add($btnRestore)
-
-$btnSysInfo = Create-Button "Mostrar Sistema" 20 280 260 32
-$form.Controls.Add($btnSysInfo)
-
-$btnExit = Create-Button "Sair" 420 280 120 32
-$form.Controls.Add($btnExit)
-
-# Disable/Enable helpers
-function Set-ControlsEnabled($state) {
-    $btnFPS.Enabled = $state
-    $btnClean.Enabled = $state
-    $btnCleanQuick.Enabled = $state
-    $btnRestorePoint.Enabled = $state
-    $btnRestore.Enabled = $state
-    $btnSysInfo.Enabled = $state
-    $btnExit.Enabled = $state
-}
-
-# Actions wiring
-$btnFPS.Add_Click({
-    try {
-        Set-ControlsEnabled($false)
-        $progress.MarqueeAnimationSpeed = 30
-        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        Opt-PlusFPS_Action
-    } finally {
-        $progress.MarqueeAnimationSpeed = 0
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        Set-ControlsEnabled($true)
-    }
-})
-
-$btnClean.Add_Click({
-    try {
-        $confirm = [System.Windows.Forms.MessageBox]::Show("Limpeza avançada irá remover caches e temporários. Continuar?", "Confirmar", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
-            Set-ControlsEnabled($false)
-            $progress.MarqueeAnimationSpeed = 30
-            $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            Clean-Temp_Action
-        }
-    } finally {
-        $progress.MarqueeAnimationSpeed = 0
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        Set-ControlsEnabled($true)
-    }
-})
-
-$btnCleanQuick.Add_Click({
-    try {
-        Set-ControlsEnabled($false)
-        $progress.MarqueeAnimationSpeed = 20
-        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        # Quick clean: temp + dns
-        $backup = Backup-Location "_quickclean"
-        try {
-            Get-ChildItem -Path $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue
-            ipconfig /flushdns > $null
-            Report-Status "Limpeza rápida concluída. Backup: $backup"
-        } catch {
-            Report-Status "Erro na limpeza rápida: $_"
-        }
-    } finally {
-        $progress.MarqueeAnimationSpeed = 0
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        Set-ControlsEnabled($true)
-    }
-})
-
-$btnRestorePoint.Add_Click({
-    $confirm = [System.Windows.Forms.MessageBox]::Show("Criar um ponto de restauração pode levar alguns minutos. Continuar?", "Confirmar", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-    if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
-        try {
-            Set-ControlsEnabled($false)
-            $progress.MarqueeAnimationSpeed = 30
-            $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-            Create-RestorePoint_Action
-        } finally {
-            $progress.MarqueeAnimationSpeed = 0
-            $form.Cursor = [System.Windows.Forms.Cursors]::Default
-            Set-ControlsEnabled($true)
-        }
-    }
-})
-
-$btnRestore.Add_Click({
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = "Selecione a pasta de backup (ex: C:\Users\SeuUser\AppData\Local\Temp\BlackNight_backup_YYYYMMDD_HHMMSS_optfps)"
-    if ($dlg.ShowDialog() -eq 'OK') {
-        Set-ControlsEnabled($false)
-        $progress.MarqueeAnimationSpeed = 20
-        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-        Restore-From-Backup -backupPath $dlg.SelectedPath
-        $progress.MarqueeAnimationSpeed = 0
-        $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        Set-ControlsEnabled($true)
-    }
-})
-
-$btnSysInfo.Add_Click({
-    Show-SystemInfo
-})
-
-$btnExit.Add_Click({ $form.Close() })
-
-# Footer note
-$footer = New-Object System.Windows.Forms.Label
-$footer.Text = "Feito por Thales · BlackNight v2.0"
-$footer.AutoSize = $false
-$footer.TextAlign = 'MiddleLeft'
-$footer.Font = New-Object System.Drawing.Font("Segoe UI",8,[System.Drawing.FontStyle]::Italic)
-$footer.Size = New-Object System.Drawing.Size(300,20)
-$footer.Location = New-Object System.Drawing.Point(20,396)
-$footer.ForeColor = [System.Drawing.Color]::FromArgb(160,160,160)
-$form.Controls.Add($footer)
-
+# Show main form
 [void]$form.ShowDialog()
-
-# ------------------ FIM ------------------
